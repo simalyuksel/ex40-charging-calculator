@@ -158,7 +158,7 @@
       </div>
       <div>
         <h1>Volvo EX40 Şarj Hesaplayıcı</h1>
-        <p style="font-size: 0.92rem; color: #64748b; margin: 6px 0 0;">79 kWh batarya ve %4.3 kayıp baz alınmıştır.</p>
+        <p style="font-size: 0.92rem; color: #64748b; margin: 6px 0 0;">79 kWh batarya ve gerçek saha verileri baz alınmıştır.</p>
       </div>
     </div>
 
@@ -170,8 +170,8 @@
 
     <label>Elektrik Bağlantı Tipi</label>
     <div class="radio-group">
-      <label><input type="radio" name="phase" value="1" checked> Tek Faz (Ev Prizi)</label>
-      <label><input type="radio" name="phase" value="3"> 3 Faz (Wallbox)</label>
+      <label><input type="radio" name="phase" value="1"> Tek Faz (Ev Prizi)</label>
+      <label><input type="radio" name="phase" value="3" checked> 3 Faz (Wallbox)</label>
     </div>
 
     <label for="amperage">Amper Ayarı (Araçtan seçilen)</label>
@@ -182,13 +182,13 @@
     <div class="result" id="result" style="display:none;"></div>
 
     <div class="note">
-      <strong>Not:</strong> %80'den sonraki yavaşlama (tapering) ve hücre dengeleme süreleri tahmine dahil edilmiştir.
+      <strong>Not:</strong> 3 fazlı şarjda yük altı şebeke gerilimi (~225V), %4.3 ortalama iletken kaybı ve %80 üzeri hücre dengeleme süreleri dahil edilmiştir.
     </div>
   </div>
 
   <script>
     const capacityKwh = 79;
-    const efficiency = 0.957; // %4.3 Kayıp baz alındı
+    const efficiency = 0.957; // %4.3 ortalama şarj kaybı
 
     function formatTime(totalHours) {
       const hours = Math.floor(totalHours);
@@ -215,55 +215,68 @@
         return;
       }
 
-      // Güç hesaplama
-      const voltage = (phase === '1') ? 230 : 400;
-      let rawPower = (phase === '1') ? (voltage * amperage) : (Math.sqrt(3) * voltage * amperage);
-      let powerKw = (rawPower * efficiency) / 1000;
-
-      let warningMsg = "";
-      if (powerKw > 11) {
-        powerKw = 11; // Volvo EX40 AC Sınırı
-        warningMsg = "<div class='warning'>* Seçilen amper 11kW limitini aşıyor, araç maksimum 11kW ile sınırlandırıldı.</div>";
+      // Yük altındaki gerçekçi ortalama faz gerilimi (Voltaj düşümü dahil)
+      const voltagePerPhase = 225; 
+      
+      let rawPowerKw = 0;
+      if (phase === '1') {
+        rawPowerKw = (voltagePerPhase * amperage) / 1000;
+      } else {
+        // 3 Faz: 3 x V x I
+        rawPowerKw = (3 * voltagePerPhase * amperage) / 1000;
       }
 
-      // Parçalı zaman hesaplama (Tapering faktörü)
+      let warningMsg = "";
+      // Volvo EX40 Maksimum AC Sınırı: 11 kW
+      if (rawPowerKw > 11) {
+        rawPowerKw = 11;
+        warningMsg = "<div class='warning'>* Seçilen amper 11 kW limitini aşıyor, araç maksimum 11 kW ile sınırlandırıldı.</div>";
+      }
+
+      // Bataryaya giren net güç
+      const netPowerKw = rawPowerKw * efficiency;
+
+      // Parçalı zaman hesabı
       let totalHours = 0;
       
-      // 0-80% Arası (Tam Güç)
+      // %0 - %80 Arası (Ana Dolum)
       if (currentSoc < 80) {
         let endPoint = Math.min(targetSoc, 80);
         let energyNeeded = capacityKwh * (endPoint - currentSoc) / 100;
-        totalHours += energyNeeded / powerKw;
+        totalHours += energyNeeded / netPowerKw;
       }
 
-      // 80-90% Arası (Hız yaklaşık %30 düşer)
+      // %80 - %90 Arası (Hız Düşümü / Tapering)
       if (targetSoc > 80) {
         let startPoint = Math.max(currentSoc, 80);
         let endPoint = Math.min(targetSoc, 90);
         if (startPoint < endPoint) {
           let energyNeeded = capacityKwh * (endPoint - startPoint) / 100;
-          let taperedPower = Math.min(powerKw, 7); // Genellikle 7kW altına düşer
-          totalHours += energyNeeded / taperedPower;
+          // Eğer çekilen güç 7 kW üstüyse 7 kW'a sınırla; 6A gibi düşük güçlerde (3.88 kW) hızı düşürme
+          let taperedNetPower = Math.min(netPowerKw, 7 * efficiency);
+          totalHours += energyNeeded / taperedNetPower;
         }
       }
 
-      // 90-100% Arası (Dengeleme aşaması - Hız çok düşer)
+      // %90 - %100 Arası (Hücre Dengeleme)
       if (targetSoc > 90) {
         let startPoint = Math.max(currentSoc, 90);
         let energyNeeded = capacityKwh * (targetSoc - startPoint) / 100;
-        let tricklePower = Math.min(powerKw, 3.5); // Dengeleme hızı yaklaşık 3.5kW
-        totalHours += (energyNeeded / tricklePower) + 0.3; // Sabit +18dk dengeleme payı
+        // Dengeleme aşamasında güç ~3.5 kW seviyesine iner
+        let trickleNetPower = Math.min(netPowerKw, 3.5 * efficiency);
+        totalHours += (energyNeeded / trickleNetPower) + 0.25; // Sabit +15 dk hücre dengeleme payı
       }
 
-      const totalEnergy = (capacityKwh * (targetSoc - currentSoc) / 100) / efficiency;
+      const totalEnergyGross = (capacityKwh * (targetSoc - currentSoc) / 100) / efficiency;
       const finishDate = new Date();
       finishDate.setMinutes(finishDate.getMinutes() + Math.round(totalHours * 60));
 
       resultEl.innerHTML = `
-        <p><strong>Net Güç:</strong> ${powerKw.toFixed(2)} kW ${warningMsg}</p>
-        <p><strong>Prizden Çekilecek:</strong> ${totalEnergy.toFixed(2)} kWh</p>
-        <p style="font-size:1.2rem; color:#10b981;"><strong>Tahmini Süre:</strong> <br>${formatTime(totalHours)}</p>
-        <p style="margin-top:10px;"><strong>Tahmini bitiş saati:</strong> ${formatClock(finishDate)}</p>
+        <p><strong>Çekilen Brüt Güç:</strong> ${rawPowerKw.toFixed(2)} kW (${phase === '1' ? 'Tek Faz' : '3 Faz - ' + amperage + 'A'}) ${warningMsg}</p>
+        <p><strong>Net Şarj Hızı:</strong> ${netPowerKw.toFixed(2)} kW</p>
+        <p><strong>Prizden Çekilecek Enerji:</strong> ${totalEnergyGross.toFixed(2)} kWh</p>
+        <p style="font-size:1.2rem; color:#10b981; margin-top:12px;"><strong>Tahmini Süre:</strong> <br>${formatTime(totalHours)}</p>
+        <p style="margin-top:8px;"><strong>Tahmini Bitiş Saati:</strong> ${formatClock(finishDate)}</p>
       `;
       resultEl.style.display = 'block';
       resultEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
